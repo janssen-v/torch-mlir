@@ -15,6 +15,7 @@
 #include "torch-mlir/Conversion/Utils/Utils.h"
 #include "torch-mlir/Dialect/Torch/IR/TorchOps.h"
 #include "torch-mlir/Dialect/Torch/Utils/Utils.h"
+#include "llvm/ADT/STLExtras.h"
 
 using namespace mlir;
 using namespace mlir::torch;
@@ -208,33 +209,37 @@ public:
       return rewriter.notifyMatchFailure(
           op, "rank of shape and result shape do not match");
 
-    SmallVector<OpFoldResult> filteredShape;
-    for (int i = 0, s = resultTy.getRank(); i < s; ++i) {
-      if (resultTy.isDynamicDim(i)) {
-        filteredShape.push_back(inShape[i]);
-        continue;
-      }
-
-      filteredShape.push_back(rewriter.getIndexAttr(resultTy.getDimSize(i)));
-    }
+    SmallVector<OpFoldResult> filteredShape = llvm::to_vector(llvm::map_range(
+        llvm::seq<int64_t>(resultTy.getRank()), [&](int64_t i) -> OpFoldResult {
+          if (resultTy.isDynamicDim(i))
+            return inShape[i];
+          return rewriter.getIndexAttr(resultTy.getDimSize(i));
+        }));
 
     Value full = adaptor.getFillValue();
+    Type targetElementType = resultTy.getElementType();
+    Type srcOriginalDtype = op.getFillValue().getType();
+    Type dstOriginalDtype;
 
-    if (full.getType() != resultTy.getElementType()) {
-      if (isa<mlir::FloatType>(full.getType())) {
-        full = arith::TruncFOp::create(rewriter, loc, resultTy.getElementType(),
-                                       full);
-      } else if (isa<mlir::IntegerType>(full.getType())) {
-        full = arith::TruncIOp::create(rewriter, loc, resultTy.getElementType(),
-                                       full);
-      }
+    if (auto originalTensorTy =
+            dyn_cast<RankedTensorType>(op.getResult().getType())) {
+      dstOriginalDtype = originalTensorTy.getElementType();
+    }
+
+    Value castedFull = convertScalarToDtype(
+        rewriter, loc, full, targetElementType, srcOriginalDtype,
+        dstOriginalDtype, op.getFillValue());
+
+    if (!castedFull) {
+      return rewriter.notifyMatchFailure(op,
+                                         "unsupported type conversion for fill "
+                                         "value via convertScalarToDtype");
     }
 
     Value outTensor = tensor::EmptyOp::create(rewriter, loc, filteredShape,
                                               resultTy.getElementType());
 
-    rewriter.replaceOpWithNewOp<linalg::FillOp>(op, full, outTensor);
-
+    rewriter.replaceOpWithNewOp<linalg::FillOp>(op, castedFull, outTensor);
     return success();
   }
 };
